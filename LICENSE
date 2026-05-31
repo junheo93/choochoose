@@ -28,6 +28,8 @@ This project is derived from / includes code from:
   * srtgo (https://github.com/lapis42/srtgo) by DKim — MIT License
   * SRT (https://github.com/ryanking13/SRT) by ryanking13 — MIT License
   * korail2 (https://github.com/carpedm20/korail2) by carpedm20 — BSD License
+  * k-skill (https://github.com/NomaDamas/k-skill) by NomaDamas — MIT License
+        (the DynaPathMasterEngine Korail anti-bot token generator in ktx.py)
 
 Their respective copyright notices and permissions apply to the portions of
 this software derived from those projects.

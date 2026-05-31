@@ -15,7 +15,9 @@ except ImportError:
     HAS_CURL_CFFI = False
 import itertools
 import json
+import random
 import re
+import string
 import time
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
@@ -27,7 +29,10 @@ from functools import reduce
 EMAIL_REGEX = re.compile(r"[^@]+@[^@]+\.[^@]+")
 PHONE_NUMBER_REGEX = re.compile(r"(\d{3})-(\d{3,4})-(\d{4})")
 
-USER_AGENT = "Dalvik/2.1.0 (Linux; U; Android 14; SM-S912N Build/UP1A.231005.007)"
+# NOTE: this User-Agent (Android 13 / SM-S928N) must stay consistent with the
+# DynaPathMasterEngine device fields (os=13, dm=SM-S928N) below — Korail's
+# anti-bot ("MACRO") check cross-references them.
+USER_AGENT = "Dalvik/2.1.0 (Linux; U; Android 13; SM-S928N Build/UP1A.231005.007)"
 
 DEFAULT_HEADERS = {
     "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
@@ -52,6 +57,141 @@ API_ENDPOINTS = {
     "refund": f"{KORAIL_MOBILE}.refunds.RefundsRequest",
     "code": f"{KORAIL_MOBILE}.common.code.do",
 }
+
+# ---------------------------------------------------------------------------
+# Korail "Dynapath" anti-bot ("MACRO ERROR") bypass.
+#
+# As of 2025 Korail rejects non-app clients on the endpoints below unless the
+# request carries a dynamically generated `x-dynapath-m-token` header plus a
+# matching `Sid` form field. The token generator (DynaPathMasterEngine) is
+# ported from NomaDamas/k-skill (MIT) and reproduces the client SDK's encoding.
+# This is an arms race: if Korail changes its rules, these values / the engine
+# must be updated again.
+# ---------------------------------------------------------------------------
+DYNAPATH_PATHS = [
+    "/classes/com.korail.mobile.certification.TicketReservation",
+    "/classes/com.korail.mobile.nonMember.NonMemTicket",
+    "/classes/com.korail.mobile.seatMovie.ScheduleView",
+    "/classes/com.korail.mobile.seatMovie.ScheduleViewSpecial",
+    "/classes/com.korail.mobile.trn.prcFare.do",
+    "/classes/com.korail.mobile.login.Login",
+]
+
+
+class DynaPathMasterEngine:
+    """Generates the `x-dynapath-m-token` header value Korail expects.
+
+    Ported from NomaDamas/k-skill (MIT License). Reproduces the obfuscated
+    encoding of the Korail app's anti-bot SDK in pure Python.
+    """
+
+    APP_ID = "com.korail.talk"
+    AS_VALUE = "%5B38ff229cb34c7dda8e28220a2d750cce%5D"
+    DEVICE_MODEL = "SM-S928N"
+    OS_TYPE = "Android"
+    SDK_VERSION = "v1"
+
+    def __init__(self) -> None:
+        self.table = "3FE9jgRD4KdCyuawklqGJYmvfMn15P7US8XbxeLQtWT6OicBAopINs2Vh0HZrz"
+        self.i8 = 161
+        self.i9 = 30
+        self.i10 = 2
+        self.app_start_ts = str(int(time.time() * 1000))
+
+    def string2xa1s(self, data: str) -> list:
+        result = []
+        idx = 0
+        while idx < len(data):
+            codepoint = ord(data[idx])
+            idx += 1
+            if codepoint < 128:
+                result.append(codepoint)
+            elif codepoint < 2048:
+                result.append(128 | ((codepoint >> 7) & 15))
+                result.append(codepoint & 127)
+            elif codepoint >= 262144:
+                result.append(160)
+                result.append((codepoint >> 14) & 127)
+                result.append((codepoint >> 7) & 127)
+                result.append(codepoint & 127)
+            elif (63488 & codepoint) != 55296:
+                result.append(((codepoint >> 14) & 15) | 144)
+                result.append((codepoint >> 7) & 127)
+                result.append(codepoint & 127)
+        return result
+
+    def make_key(self, key: str) -> int:
+        total = 0
+        for char in key:
+            codepoint = ord(char)
+            bit = 32768
+            for _ in range(16):
+                if bit & codepoint:
+                    break
+                bit >>= 1
+            total = (total * (bit << 1)) + codepoint
+        return total
+
+    def internal_char(self, base_table: str, remainder: int, current: str) -> str:
+        seen = 0
+        for char in base_table:
+            if char in current:
+                continue
+            if seen == remainder:
+                return char
+            seen += 1
+        return " "
+
+    def make_encode_table(self, number: int, encode_size: int, base_table: str) -> str:
+        chars = ""
+        temp = number
+        for index in range(encode_size):
+            divisor = encode_size - index
+            remainder = temp % divisor
+            chars += self.internal_char(base_table, remainder, chars)
+            temp //= divisor
+        return chars
+
+    def encode_normal_be(self, data: str, table: str) -> str:
+        values = self.string2xa1s(data)
+        output = []
+        digits = [0] * (self.i10 + 1)
+        idx = 0
+        tail = len(values) % self.i10
+        body_size = len(values) - tail
+        while idx < body_size:
+            value = 0
+            for _ in range(self.i10):
+                value = (value * self.i8) + values[idx]
+                idx += 1
+            for digit_index in range(self.i10 + 1):
+                digits[digit_index] = value % self.i9
+                value //= self.i9
+            for digit_index in range(self.i10, -1, -1):
+                output.append(table[digits[digit_index]])
+        if tail > 0:
+            value = 0
+            for _ in range(tail):
+                value = (value * self.i8) + values[idx]
+                idx += 1
+            for digit_index in range(tail + 1):
+                digits[digit_index] = value % self.i9
+                value //= self.i9
+            while tail >= 0:
+                output.append(table[digits[tail]])
+                tail -= 1
+        return "".join(output)
+
+    def generate_token(self, device_id: str, timestamp_ms: int, nonce: str) -> str:
+        plaintext = (
+            f"ai={self.APP_ID}&di={device_id}&as={self.AS_VALUE}&su=false&dbg=false&emu=false&hk=false"
+            f"&it={self.app_start_ts}&ts={timestamp_ms}&rt=0&os=13&dm={self.DEVICE_MODEL}&st={self.OS_TYPE}&sv={self.SDK_VERSION}"
+        )
+        dyn_key = f"v1+{nonce}+{timestamp_ms}"
+        key_encoded = self.encode_normal_be(dyn_key, self.table)
+        table = self.make_encode_table(self.make_key(dyn_key), self.i9, self.table)
+        body_encoded = self.encode_normal_be(plaintext, table)
+        return f"bEeEP{self.table[len(key_encoded)]}{key_encoded}{body_encoded}"
 
 
 # Schedule classes
@@ -515,9 +655,13 @@ class Korail:
             self._session = requests.session()
         self._session.headers.update(DEFAULT_HEADERS)
         self._device = "AD"
-        self._version = "240531001"
+        self._version = "250601002"
         self._key = "korail1234567890"
         self._idx = None
+        # Dynapath anti-bot ("MACRO ERROR") bypass state
+        self._engine = DynaPathMasterEngine()
+        self._sid_key = b"2485dd54d9deaa36"
+        self._device_id = "558a4f02041657ea"
         self.korail_id = korail_id
         self.korail_pw = korail_pw
         self.verbose = verbose
@@ -532,6 +676,20 @@ class Korail:
     def _log(self, msg: str) -> None:
         if self.verbose:
             print(f"[*] {msg}")
+
+    def _generate_sid(self, timestamp_ms: int) -> str:
+        plaintext = f"{self._device}{timestamp_ms}".encode("utf-8")
+        cipher = AES.new(self._sid_key, AES.MODE_CBC, iv=self._sid_key)
+        return base64.b64encode(cipher.encrypt(pad(plaintext, 16))).decode("utf-8") + "\n"
+
+    def _dynapath_auth(self, url: str):
+        """Return (headers, sid) for Dynapath-protected endpoints, else ({}, None)."""
+        if not any(path in url for path in DYNAPATH_PATHS):
+            return {}, None
+        timestamp_ms = int(time.time() * 1000)
+        nonce = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
+        token = self._engine.generate_token(self._device_id, timestamp_ms, nonce)
+        return {"x-dynapath-m-token": token}, self._generate_sid(timestamp_ms)
 
     def __enc_password(self, password):
         url = API_ENDPOINTS["code"]
@@ -575,7 +733,11 @@ class Korail:
             "idx": self._idx,
         }
 
-        r = self._session.post(API_ENDPOINTS["login"], data=data)
+        headers, sid = self._dynapath_auth(API_ENDPOINTS["login"])
+        if sid:
+            data["Sid"] = sid
+
+        r = self._session.post(API_ENDPOINTS["login"], data=data, headers=headers)
         self._log(r.text)
         j = json.loads(r.text)
 
@@ -669,7 +831,13 @@ class Korail:
             "mbCrdNo": self.membership_number,
         }
 
-        r = self._session.get(API_ENDPOINTS["search_schedule"], params=data)
+        headers, sid = self._dynapath_auth(API_ENDPOINTS["search_schedule"])
+        if sid:
+            data["Sid"] = sid
+
+        r = self._session.get(
+            API_ENDPOINTS["search_schedule"], params=data, headers=headers
+        )
         self._log(r.text)
         j = json.loads(r.text)
 
@@ -757,7 +925,11 @@ class Korail:
         for i, psg in enumerate(passengers, 1):
             data.update(psg.get_dict(i))
 
-        r = self._session.get(API_ENDPOINTS["reserve"], params=data)
+        headers, sid = self._dynapath_auth(API_ENDPOINTS["reserve"])
+        if sid:
+            data["Sid"] = sid
+
+        r = self._session.get(API_ENDPOINTS["reserve"], params=data, headers=headers)
         self._log(r.text)
         j = json.loads(r.text)
         if self._result_check(j):

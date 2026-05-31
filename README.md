@@ -116,6 +116,19 @@ choochoose/
 └── README.md
 ```
 
+## KTX/Korail anti-bot note
+
+Korail guards its mobile API with an anti-bot system ("Dynapath"). Plain
+clients get rejected with `MACRO ERROR (앱을 최신 버전으로 업데이트...)`. choochoose
+includes the `DynaPathMasterEngine` token generator (ported from
+[`k-skill`](https://github.com/NomaDamas/k-skill), MIT) plus the matching app
+version / User-Agent in [`ktx.py`](choochoose/ktx.py) to satisfy that check.
+
+This is an **arms race**: if Korail changes its rules, KTX will start failing
+again and the engine, `_version` (`250601002`), and `USER_AGENT` will need
+updating. SRT uses a different system (NetFunnel) and is unaffected.
+
 ## Credits
 
-`srtgo` by DKim, `SRT` by ryanking13, `korail2` by carpedm20. See [LICENSE](LICENSE).
+`srtgo` by DKim, `SRT` by ryanking13, `korail2` by carpedm20, Dynapath engine
+from `k-skill` by NomaDamas. See [LICENSE](LICENSE).
