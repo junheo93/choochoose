@@ -1,0 +1,46 @@
+# ---------------------------------------------------------------------------
+# choochoose stores ALL secrets in the OS keyring, never in files. This
+# .gitignore is a belt-and-suspenders guard so that even if you experiment
+# with local config / env files, nothing sensitive can be committed.
+# ---------------------------------------------------------------------------
+
+# Secrets & credentials — never commit
+.env
+.env.*
+*.env
+secrets.*
+credentials.*
+*credential*
+*secret*
+*password*
+*.pem
+*.key
+*.p12
+*.keyring
+config.local.*
+choochoose.local.*
+
+# Logs (debug mode prints request/response bodies to the terminal; if you ever
+# redirect that to a file, keep it out of git)
+*.log
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS / editor cruft
+.DS_Store
+.idea/
+.vscode/
+*.swp
