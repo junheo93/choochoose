@@ -31,7 +31,7 @@ website, and (only if you opt in) *your own* Telegram bot.
 | **Git safety** | Because nothing sensitive touches the filesystem, nothing sensitive can be committed. A strict [`.gitignore`](.gitignore) additionally blocks `.env`, `*secret*`, `*password*`, key files, and logs as a backstop. |
 | **Namespaced storage** | All keyring entries are prefixed with `choochoose:` so they're isolated, auditable, and removable in one command (`choochoose --wipe`). |
 | **Network egress** | The *only* outbound calls are to the railway endpoints (`app.srail.or.kr`, `smart.letskorail.com`, and their NetFunnel queue hosts) and, if configured, `api.telegram.org`. There is **no telemetry, analytics, crash reporting, or any third-party call**. |
-| **Telegram** | Optional and off by default. Messages go to the chat id *you* provide, through a bot token *you* create. |
+| **Telegram** | A standard, on-by-default notification channel — but it talks only to *your* bot: messages go to the chat id *you* provide, through a bot token *you* create. Never any third party. |
 | **Logging** | `--debug` prints raw request/response bodies to **your local terminal only** — useful for debugging, never sent anywhere. Don't redirect that output into a file you then commit (the `.gitignore` covers `*.log` if you do). |
 
 To erase every trace of your data from the keyring:
@@ -48,13 +48,15 @@ Requires Python ≥ 3.10.
 
 ```bash
 cd choochoose
-python -m venv .venv && source .venv/bin/activate
+conda create -y -n choochoose python=3.11
+conda activate choochoose
 pip install -e .
 ```
 
-This installs the `choochoose` command. On Linux you may also need a keyring
-backend (e.g. `pip install keyrings.alt` or a running Secret Service / GNOME
-Keyring).
+This installs the `choochoose` command into the `choochoose` env. Run it any
+time with `conda activate choochoose && choochoose`. On Linux you may also need
+a keyring backend (e.g. `pip install keyrings.alt` or a running Secret Service /
+GNOME Keyring).
 
 ## Usage
 
@@ -75,7 +77,11 @@ You'll get an interactive menu:
 | 예매 옵션 설정 | Enable child/senior/disability fares, KTX-only, etc. |
 | 저장된 개인정보 삭제 | Wipe all stored secrets from the keyring |
 
-### Telegram notifications (optional)
+### Telegram notifications
+
+Telegram is choochoose's default notification channel — set it up once and
+you'll be kept in the loop without watching the terminal. It only ever talks to
+the bot *you* create, so it stays private.
 
 1. Talk to [@BotFather](https://t.me/BotFather) → `/newbot` → copy the **token**.
 2. Send your new bot any message, then visit
