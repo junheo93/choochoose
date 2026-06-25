@@ -131,9 +131,14 @@ ChoiceType = Union[int, None]
 @click.command()
 @click.option("--debug", is_flag=True, help="Verbose request/response logging (local terminal only)")
 @click.option("--wipe", is_flag=True, help="Delete every choochoose secret from the OS keyring and exit")
-def choochoose(debug=False, wipe=False):
+@click.option("--bot", is_flag=True, help="Start the Telegram bot for remote booking (long-polling, outbound only)")
+def choochoose(debug=False, wipe=False, bot=False):
     if wipe:
         wipe_secrets()
+        return
+
+    if bot:
+        start_bot(debug)
         return
 
     MENU_CHOICES = [
@@ -145,6 +150,7 @@ def choochoose(debug=False, wipe=False):
         ("역 설정", 6),
         ("역 직접 수정", 7),
         ("예매 옵션 설정", 8),
+        ("텔레그램 봇 시작 (원격 예매)", 10),
         ("저장된 개인정보 삭제 (keyring)", 9),
         ("나가기", -1),
     ]
@@ -165,6 +171,7 @@ def choochoose(debug=False, wipe=False):
         7: lambda rt: edit_station(rt),
         8: lambda _: set_options(),
         9: lambda _: wipe_secrets(),
+        10: lambda _: start_bot(debug),
     }
 
     while True:
@@ -188,6 +195,14 @@ def choochoose(debug=False, wipe=False):
         action = ACTIONS.get(choice)
         if action:
             action(rail_type)
+
+
+def start_bot(debug=False) -> None:
+    """Launch the Telegram remote-booking bot (imported lazily to avoid a
+    circular import and to keep the bot dependency out of the normal CLI path)."""
+    from .bot import run_bot
+
+    run_bot(debug=debug)
 
 
 def wipe_secrets() -> None:
@@ -693,44 +708,90 @@ def reserve(rail_type="SRT", debug=False):
         print(colored("예매 정보 입력 중 취소되었습니다", "green", "on_red") + "\n")
         return
 
-    # Reserve function
+    # CLI front-end: print celebratory status to the terminal AND mirror it to
+    # Telegram, render the spinning waiting bar, and use the interactive error
+    # handler. The actual retry/reserve logic lives in run_reserve_loop so the
+    # Telegram bot can reuse it with its own callbacks.
+    tgprintf = get_telegram()
+
+    def _notify(msg):
+        print(colored(f"\n\n{msg}\n", "red", "on_green"))
+        asyncio.run(tgprintf(msg))
+
+    def _tick(i_try, elapsed):
+        hours, remainder = divmod(int(elapsed), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        print(
+            f"\r예매 대기 중... {WAITING_BAR[i_try & 3]} {i_try:4d} ({hours:02d}:{minutes:02d}:{seconds:02d}) ",
+            end="",
+            flush=True,
+        )
+
+    run_reserve_loop(
+        rail,
+        rail_type=rail_type,
+        params=params,
+        indices=choice["trains"],
+        passengers=passengers,
+        option=options["type"],
+        pay=options["pay"],
+        notify=_notify,
+        handle_error=_handle_error,
+        on_tick=_tick,
+        debug=debug,
+    )
+
+
+def run_reserve_loop(
+    rail,
+    *,
+    rail_type,
+    params,
+    indices,
+    passengers,
+    option,
+    pay,
+    notify,
+    handle_error,
+    on_tick=None,
+    should_stop=None,
+    debug=False,
+):
+    """I/O-agnostic auto-retry reservation loop shared by the CLI and the bot.
+
+    notify(msg): deliver a human-readable status/success line.
+    handle_error(ex, msg=None) -> bool: report an error; return False to abort.
+    on_tick(i_try, elapsed): optional per-iteration progress hook.
+    should_stop() -> bool: optional cancel check, polled each iteration.
+    Returns True once a reservation succeeds, False if aborted/given up.
+    """
+
     def _reserve(train):
-        reserve = rail.reserve(train, passengers=passengers, option=options["type"])
+        reserve = rail.reserve(train, passengers=passengers, option=option)
         msg = f"{reserve}"
         if hasattr(reserve, "tickets") and reserve.tickets:
             msg += "\n" + "\n".join(map(str, reserve.tickets))
 
-        print(colored(f"\n\n🎫 🎉 예매 성공!!! 🎉 🎫\n{msg}\n", "red", "on_green"))
+        notify(f"🎫 🎉 예매 성공!!! 🎉 🎫\n{msg}")
 
-        if options["pay"] and not reserve.is_waiting and pay_card(rail, reserve):
-            print(
-                colored("\n\n💳 ✨ 결제 성공!!! ✨ 💳\n\n", "green", "on_red"), end=""
-            )
-            msg += "\n결제 완료"
+        if pay and not reserve.is_waiting and pay_card(rail, reserve):
+            notify("💳 ✨ 결제 성공!!! ✨ 💳")
 
-        tgprintf = get_telegram()
-        asyncio.run(tgprintf(msg))
-
-    # Reservation loop
     i_try = 0
     start_time = time.time()
     while True:
+        if should_stop is not None and should_stop():
+            return False
         try:
             i_try += 1
-            elapsed_time = time.time() - start_time
-            hours, remainder = divmod(int(elapsed_time), 3600)
-            minutes, seconds = divmod(remainder, 60)
-            print(
-                f"\r예매 대기 중... {WAITING_BAR[i_try & 3]} {i_try:4d} ({hours:02d}:{minutes:02d}:{seconds:02d}) ",
-                end="",
-                flush=True,
-            )
+            if on_tick is not None:
+                on_tick(i_try, time.time() - start_time)
 
             trains = rail.search_train(**params)
-            for i in choice["trains"]:
-                if _is_seat_available(trains[i], options["type"], rail_type):
+            for i in indices:
+                if _is_seat_available(trains[i], option, rail_type):
                     _reserve(trains[i])
-                    return
+                    return True
             _sleep()
 
         except SRTError as ex:
@@ -749,8 +810,8 @@ def reserve(rail_type="SRT", debug=False):
                         f"\nException: {ex}\nType: {type(ex)}\nArgs: {ex.args}\nMessage: {msg}"
                     )
                 rail = login(rail_type, debug=debug)
-                if not rail.is_login and not _handle_error(ex):
-                    return
+                if not rail.is_login and not handle_error(ex):
+                    return False
             elif not any(
                 err in msg
                 for err in (
@@ -760,22 +821,22 @@ def reserve(rail_type="SRT", debug=False):
                     "예약대기자한도수초과",
                 )
             ):
-                if not _handle_error(ex):
-                    return
+                if not handle_error(ex):
+                    return False
             _sleep()
 
         except KorailError as ex:
             msg = ex.msg
             if "Need to Login" in msg:
                 rail = login(rail_type, debug=debug)
-                if not rail.is_login and not _handle_error(ex):
-                    return
+                if not rail.is_login and not handle_error(ex):
+                    return False
             elif not any(
                 err in msg
                 for err in ("Sold out", "잔여석없음", "예약대기자한도수초과")
             ):
-                if not _handle_error(ex):
-                    return
+                if not handle_error(ex):
+                    return False
             _sleep()
 
         except JSONDecodeError as ex:
@@ -787,15 +848,15 @@ def reserve(rail_type="SRT", debug=False):
             rail = login(rail_type, debug=debug)
 
         except ConnectionError as ex:
-            if not _handle_error(ex, "연결이 끊겼습니다"):
-                return
+            if not handle_error(ex, "연결이 끊겼습니다"):
+                return False
             rail = login(rail_type, debug=debug)
 
         except Exception as ex:
             if debug:
                 print("\nUndefined exception")
-            if not _handle_error(ex):
-                return
+            if not handle_error(ex):
+                return False
             rail = login(rail_type, debug=debug)
 
 

@@ -75,6 +75,7 @@ You'll get an interactive menu:
 | 카드 설정 | Save a card for optional auto-payment |
 | 역 설정 / 역 직접 수정 | Pick the stations shown in the booking menu |
 | 예매 옵션 설정 | Enable child/senior/disability fares, KTX-only, etc. |
+| 텔레그램 봇 시작 (원격 예매) | Run the Telegram bot so you can book from your phone (see below) |
 | 저장된 개인정보 삭제 | Wipe all stored secrets from the keyring |
 
 ### Telegram notifications
@@ -90,6 +91,62 @@ the bot *you* create, so it stays private.
 
 You'll then get a Telegram ping on a successful reservation, on payment, and on
 recoverable errors during the retry loop.
+
+### Remote booking from your phone (Telegram bot)
+
+When you can't reach the machine running choochoose directly (it's behind
+NAT / a firewall / has no public IP), drive a booking entirely from the
+**Telegram app on your phone**. The bot uses long-polling — it makes only
+*outbound* calls to `api.telegram.org` — so no inbound port, public IP, or SSH
+is needed.
+
+> **Start it on the host while you still have access, and keep it running.**
+> Thereafter you control it remotely from Telegram. Requires **로그인 설정** and
+> **텔레그램 설정** to be done first.
+
+```bash
+choochoose --bot          # or menu → "텔레그램 봇 시작 (원격 예매)"
+```
+
+Then, in your Telegram chat with the bot:
+
+| Command | What it does |
+|---|---|
+| `/book` | Walk through 열차→역→날짜→시각→인원→열차선택→좌석→결제 with inline buttons, then start the auto-retry loop |
+| `/status` | Show the current waiting status (try count + elapsed) |
+| `/stop` | Stop the running waiting loop |
+| `/cancel` | Cancel the booking form you're filling in |
+
+Only messages from your saved **chat id** are accepted — anyone else who finds
+the bot is silently ignored and can never book on your account. (MVP supports
+adult passengers only; child/senior/disability fares stay CLI-only for now.)
+
+**Keep the bot alive** so it survives logout / reboot. With `tmux`:
+
+```bash
+tmux new -s choochoose 'conda activate choochoose && choochoose --bot'
+# detach: Ctrl-b d   ·   reattach: tmux attach -t choochoose
+```
+
+Or as a `systemd` user service (`~/.config/systemd/user/choochoose-bot.service`):
+
+```ini
+[Unit]
+Description=choochoose Telegram booking bot
+After=network-online.target
+
+[Service]
+ExecStart=%h/miniconda3/envs/choochoose/bin/choochoose --bot
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user enable --now choochoose-bot
+loginctl enable-linger "$USER"   # keep it running after you log out
+```
 
 ---
 
@@ -108,6 +165,7 @@ re-logging-in or re-queuing automatically.
 choochoose/
 ├── choochoose/
 │   ├── cli.py    # interactive menu, reservation loop, keyring + telegram
+│   ├── bot.py    # Telegram remote-booking bot (long-polling, reuses cli loop)
 │   ├── srt.py    # SRT mobile API client            (MIT, from SRT/srtgo)
 │   └── ktx.py    # Korail/KTX mobile API client      (BSD, from korail2)
 ├── pyproject.toml
