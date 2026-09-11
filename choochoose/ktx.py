@@ -45,7 +45,6 @@ DEFAULT_HEADERS = {
 KORAIL_MOBILE = "https://smart.letskorail.com:443/classes/com.korail.mobile"
 API_ENDPOINTS = {
     "login": f"{KORAIL_MOBILE}.login.Login",
-    "logout": f"{KORAIL_MOBILE}.common.logout",
     "search_schedule": f"{KORAIL_MOBILE}.seatMovie.ScheduleView",
     "reserve": f"{KORAIL_MOBILE}.certification.TicketReservation",
     "cancel": f"{KORAIL_MOBILE}.reservationCancel.ReservationCancelChk",
@@ -237,7 +236,6 @@ class Train(Schedule):
 
     def __init__(self, data):
         super().__init__(data)
-        self.reserve_possible = data.get("h_rsv_psb_flg")
         self.reserve_possible_name = data.get("h_rsv_psb_nm")
         self.special_seat = data.get("h_spe_rsv_cd")
         self.general_seat = data.get("h_gen_rsv_cd")
@@ -290,8 +288,6 @@ class Ticket(Train):
         super().__init__(raw_data)
         self.seat_no_end = raw_data.get("h_seat_no_end")
         self.seat_no_count = int(raw_data.get("h_seat_cnt"))
-        self.buyer_name = raw_data.get("h_buy_ps_nm")
-        self.sale_date = raw_data.get("h_orgtk_sale_dt")
         self.pnr_no = raw_data.get("h_pnr_no")
         self.sale_info1 = raw_data.get("h_orgtk_wct_no")
         self.sale_info2 = raw_data.get("h_orgtk_ret_sale_dt")
@@ -311,13 +307,6 @@ class Ticket(Train):
         repr_str += f", {self.price}원"
         return repr_str
 
-    def get_ticket_no(self):
-        return "-".join(
-            map(
-                str,
-                (self.sale_info1, self.sale_info2, self.sale_info3, self.sale_info4),
-            )
-        )
 
 
 class Reservation(Train):
@@ -480,15 +469,7 @@ class Disability4To6Passenger(Passenger):
 # Options
 class TrainType:
     KTX = "100"
-    SAEMAEUL = "101"
-    MUGUNGHWA = "102"
-    TONGGUEN = "103"
-    NURIRO = "102"
     ALL = "109"
-    AIRPORT = "105"
-    KTX_SANCHEON = "100"
-    ITX_SAEMAEUL = "101"
-    ITX_CHEONGCHUN = "104"
 
 
 class ReserveOption:
@@ -529,120 +510,6 @@ class SoldOutError(KorailError):
 
     def __init__(self, code=None):
         super().__init__("Sold out", code)
-
-
-class NetFunnelError(Exception):
-    def __init__(self, msg):
-        self.msg = msg
-
-    def __str__(self):
-        return self.msg
-
-
-# NetFunnel
-class NetFunnelHelper:
-    NETFUNNEL_URL = "http://nf.letskorail.com/ts.wseq"
-
-    WAIT_STATUS_PASS = "200"
-    WAIT_STATUS_FAIL = "201"
-    ALREADY_COMPLETED = "502"
-
-    OP_CODE = {
-        "getTidchkEnter": "5101",
-        "chkEnter": "5002",
-        "setComplete": "5004",
-    }
-
-    DEFAULT_HEADERS = {
-        "Host": "nf.letskorail.com",
-        "Connection": "Keep-Alive",
-        "User-Agent": "Apache-HttpClient/UNAVAILABLE (java 1.4)",
-    }
-
-    def __init__(self):
-        if HAS_CURL_CFFI:
-            self._session = curl_cffi.Session(impersonate="chrome131_android")
-        else:
-            self._session = requests.session()
-        self._session.headers.update(self.DEFAULT_HEADERS)
-        self._cached_key = None
-        self._last_fetch_time = 0
-        self._cache_ttl = 50  # 50 seconds
-
-    def run(self):
-        current_time = time.time()
-        if self._is_cache_valid(current_time):
-            return self._cached_key
-
-        try:
-            status, self._cached_key, nwait = self._start()
-            self._last_fetch_time = current_time
-
-            while status == self.WAIT_STATUS_FAIL:
-                print(f"\r현재 {nwait}명 대기중...", end="", flush=True)
-                time.sleep(1)
-                status, self._cached_key, nwait = self._check()
-
-            # Try completing once
-            status, _, _ = self._complete()
-            if status == self.WAIT_STATUS_PASS or status == self.ALREADY_COMPLETED:
-                return self._cached_key
-
-            self.clear()
-            raise NetFunnelError("Failed to complete NetFunnel")
-
-        except Exception as ex:
-            self.clear()
-            raise NetFunnelError(str(ex))
-
-    def clear(self):
-        self._cached_key = None
-        self._last_fetch_time = 0
-
-    def _start(self):
-        return self._make_request("getTidchkEnter")
-
-    def _check(self):
-        return self._make_request("chkEnter")
-
-    def _complete(self):
-        return self._make_request("setComplete")
-
-    def _make_request(self, opcode: str):
-        params = self._build_params(self.OP_CODE[opcode])
-        response = self._parse(
-            self._session.get(self.NETFUNNEL_URL, params=params).text
-        )
-        return response.get("status"), response.get("key"), response.get("nwait")
-
-    def _build_params(self, opcode: str, key: str = None) -> dict:
-        params = {"opcode": opcode}
-
-        if opcode in (self.OP_CODE["getTidchkEnter"], self.OP_CODE["chkEnter"]):
-            params.update({"sid": "service_1", "aid": "act_8"})
-            if opcode == self.OP_CODE["chkEnter"]:
-                params.update({"key": key or self._cached_key, "ttl": "1"})
-        elif opcode == self.OP_CODE["setComplete"]:
-            params["key"] = key or self._cached_key
-
-        return params
-
-    def _parse(self, response: str) -> dict:
-        status, params_str = response.split(":", 1)
-        if not params_str:
-            raise NetFunnelError("Failed to parse NetFunnel response")
-
-        params = dict(
-            param.split("=", 1) for param in params_str.split("&") if "=" in param
-        )
-        params["status"] = status
-        return params
-
-    def _is_cache_valid(self, current_time: float) -> bool:
-        return bool(
-            self._cached_key
-            and (current_time - self._last_fetch_time) < self._cache_ttl
-        )
 
 
 class Korail:
@@ -747,18 +614,18 @@ class Korail:
             self.name = j["strCustNm"]
             self.email = j["strEmailAdr"]
             self.phone_number = j["strCpNo"]
-            print(
-                f"로그인 성공: {self.name} (멤버십번호: {self.membership_number}, 전화번호: {self.phone_number})"
-            )
+            if self.verbose:
+                print(
+                    f"로그인 성공: {self.name} (멤버십번호: {self.membership_number}, 전화번호: {self.phone_number})"
+                )
+            else:
+                # 봇을 systemd로 돌리면 이 줄이 journald에 영구히 쌓인다.
+                # 이름·멤버십번호·전화번호는 --debug 일 때만 찍는다.
+                print("로그인 성공")
             self.logined = True
             return True
         self.logined = False
         return False
-
-    def logout(self):
-        r = self._session.get(API_ENDPOINTS["logout"])
-        self._log(r.text)
-        self.logined = False
 
     def _result_check(self, j):
         if j.get("strResult") == "FAIL":
@@ -825,7 +692,10 @@ class Korail:
             "txtSeatAttCd_3": "000",
             "txtSeatAttCd_4": "015",
             "ebizCrossCheck": "N",
-            "srtCheckYn": "N",  # SRT 함께 보기
+            # SRT 함께 보기. 통합 후 구 SRT 열차(수서·동탄발 3xx번대)는 Korail
+            # 스케줄에 KTX-산천으로 직접 들어와 있어 이 플래그는 Y/N 결과가
+            # 동일하다(2026-09 실측). 원래 값 유지.
+            "srtCheckYn": "N",
             "rtYn": "N",  # 왕복
             "adjStnScdlOfrFlg": "N",  # 인접역 보기
             "mbCrdNo": self.membership_number,
