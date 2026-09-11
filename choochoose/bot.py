@@ -35,6 +35,7 @@ from telegram.ext import (
 )
 
 from .cli import (
+    RAIL,
     get_options,
     get_station,
     kr_get,
@@ -44,16 +45,13 @@ from .cli import (
 
 from .ktx import (
     AdultPassenger,
+    NoResultsError,
     ReserveOption,
     TrainType,
 )
-from .srt import (
-    Adult,
-    SeatType,
-)
 
 # Conversation states
-(RAIL, DEP, ARR, DATE, TIME, ADULT, TRAINS, SEAT, PAY) = range(9)
+(DEP, ARR, DATE, TIME, ADULT, TRAINS, SEAT, PAY) = range(8)
 
 DATE_PAGE = 9  # date buttons per page (3 columns x 3 rows)
 
@@ -66,7 +64,7 @@ SEAT_CHOICES = [
 
 HELP_TEXT = (
     "🚆 choochoose 원격 예매 봇\n\n"
-    "/book — 예매 시작 (열차→역→날짜→시각→인원→열차선택→좌석→결제)\n"
+    "/book — 예매 시작 (역→날짜→시각→인원→열차선택→좌석→결제)\n"
     "/status — 진행 중인 예매 대기 상태\n"
     "/stop — 진행 중인 예매 대기 중지\n"
     "/cancel — 입력 중인 예매 취소\n\n"
@@ -85,12 +83,9 @@ def _now():
     return datetime.now() + timedelta(minutes=10)
 
 
-def _date_choices(rail_type):
+def _date_choices():
     now = _now()
-    if rail_type == "SRT":
-        max_days = 30 if now.hour >= 7 else 29
-    else:
-        max_days = 31 if now.hour >= 7 else 30
+    max_days = 31 if now.hour >= 7 else 30
     return [
         (
             (now + timedelta(days=i)).strftime("%m/%d %a"),
@@ -100,8 +95,8 @@ def _date_choices(rail_type):
     ]
 
 
-def _station_keyboard(rail_type, prefix):
-    _, keys = get_station(rail_type)
+def _station_keyboard(prefix):
+    _, keys = get_station()
     rows = [
         [_btn(name, f"{prefix}|{name}") for name in keys[i : i + 2]]
         for i in range(0, len(keys), 2)
@@ -110,8 +105,8 @@ def _station_keyboard(rail_type, prefix):
     return InlineKeyboardMarkup(rows)
 
 
-def _date_keyboard(rail_type, page):
-    choices = _date_choices(rail_type)
+def _date_keyboard(page):
+    choices = _date_choices()
     pages = max(1, (len(choices) + DATE_PAGE - 1) // DATE_PAGE)
     page = max(0, min(page, pages - 1))
     chunk = choices[page * DATE_PAGE : page * DATE_PAGE + DATE_PAGE]
@@ -192,30 +187,16 @@ async def cmd_book(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     context.user_data.clear()
-    await update.message.reply_text(
-        "열차를 선택하세요.",
-        reply_markup=InlineKeyboardMarkup(
-            [[_btn("SRT", "rail|SRT"), _btn("KTX", "rail|KTX")], [_btn("취소", "cancel")]]
-        ),
-    )
-    return RAIL
 
-
-async def on_rail(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    rail_type = q.data.split("|", 1)[1]
-
-    if not kr_get(rail_type, "id") or not kr_get(rail_type, "pass"):
-        await q.edit_message_text(
-            f"{rail_type} 로그인이 설정돼 있지 않습니다. 먼저 서버에서 '로그인 설정'을 완료하세요."
+    if not kr_get(RAIL, "id") or not kr_get(RAIL, "pass"):
+        await update.message.reply_text(
+            "로그인이 설정돼 있지 않습니다. 먼저 서버에서 '로그인 설정'을 완료하세요."
         )
         return ConversationHandler.END
 
-    context.user_data["rail_type"] = rail_type
-    await q.edit_message_text(
-        f"[{rail_type}] 출발역을 선택하세요.",
-        reply_markup=_station_keyboard(rail_type, "dep"),
+    await update.message.reply_text(
+        "출발역을 선택하세요.",
+        reply_markup=_station_keyboard("dep"),
     )
     return DEP
 
@@ -224,10 +205,9 @@ async def on_dep(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     context.user_data["dep"] = q.data.split("|", 1)[1]
-    rail_type = context.user_data["rail_type"]
     await q.edit_message_text(
         f"출발: {context.user_data['dep']}\n도착역을 선택하세요.",
-        reply_markup=_station_keyboard(rail_type, "arr"),
+        reply_markup=_station_keyboard("arr"),
     )
     return ARR
 
@@ -240,10 +220,9 @@ async def on_arr(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("출발역과 도착역이 같습니다.", show_alert=True)
         return ARR
     context.user_data["arr"] = arr
-    rail_type = context.user_data["rail_type"]
     await q.edit_message_text(
         f"{context.user_data['dep']} → {arr}\n날짜를 선택하세요.",
-        reply_markup=_date_keyboard(rail_type, 0),
+        reply_markup=_date_keyboard(0),
     )
     return DATE
 
@@ -252,8 +231,7 @@ async def on_date_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     page = int(q.data.split("|", 1)[1])
-    rail_type = context.user_data["rail_type"]
-    await q.edit_message_reply_markup(reply_markup=_date_keyboard(rail_type, page))
+    await q.edit_message_reply_markup(reply_markup=_date_keyboard(page))
     return DATE
 
 
@@ -289,8 +267,6 @@ async def on_adult(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     ud = context.user_data
     ud["adult"] = int(q.data.split("|", 1)[1])
-    rail_type = ud["rail_type"]
-    is_srt = rail_type == "SRT"
     options = get_options()
     debug = context.application.bot_data.get("debug", False)
 
@@ -301,35 +277,33 @@ async def on_adult(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ):
         ud["time"] = now.strftime("%H%M%S")
 
-    adult_cls = Adult if is_srt else AdultPassenger
     params = {
         "dep": ud["dep"],
         "arr": ud["arr"],
         "date": ud["date"],
         "time": ud["time"],
-        "passengers": [adult_cls(ud["adult"])],
-        **(
-            {"available_only": False}
-            if is_srt
-            else {
-                "include_no_seats": True,
-                **({"train_type": TrainType.KTX} if "ktx" in options else {}),
-            }
-        ),
+        "passengers": [AdultPassenger(ud["adult"])],
+        "include_no_seats": True,
+        **({"train_type": TrainType.KTX} if "ktx" in options else {}),
     }
     ud["params"] = params
-    ud["passengers"] = [adult_cls(ud["adult"])]
+    ud["passengers"] = [AdultPassenger(ud["adult"])]
 
     await q.edit_message_text("열차를 검색 중입니다…")
     try:
-        rail = await asyncio.to_thread(login, rail_type, debug)
+        rail = await asyncio.to_thread(login, debug)
         trains = await asyncio.to_thread(rail.search_train, **params)
-    except Exception as ex:  # noqa: BLE001 — surface any search failure to the user
-        await q.edit_message_text(f"열차 검색 실패: {ex}")
+    except NoResultsError:
+        # 코레일 조회 API는 직통 스케줄만 돌려준다. 환승이 필요한 구간
+        # (예: 전주→부산)은 여기로 떨어진다 — 봇 오류가 아니다.
+        await q.edit_message_text(
+            f"{ud['dep']} → {ud['arr']} 구간에 조회된 열차가 없습니다.\n"
+            "직통 열차가 없는 구간이거나(코레일 조회는 환승 경로를 지원하지 않습니다) "
+            "해당 날짜·시간대에 운행이 없습니다.\n/book 으로 다시 시도하세요."
+        )
         return ConversationHandler.END
-
-    if not trains:
-        await q.edit_message_text("예약 가능한 열차가 없습니다. /book 으로 다시 시도하세요.")
+    except Exception as ex:  # noqa: BLE001 — surface any search failure to the user
+        await q.edit_message_text(f"열차 검색 실패: {getattr(ex, 'msg', ex)}")
         return ConversationHandler.END
 
     ud["rail"] = rail
@@ -371,9 +345,7 @@ async def on_seat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     name = q.data.split("|", 1)[1]
-    is_srt = context.user_data["rail_type"] == "SRT"
-    seat_enum = SeatType if is_srt else ReserveOption
-    context.user_data["option"] = getattr(seat_enum, name)
+    context.user_data["option"] = getattr(ReserveOption, name)
 
     card_ok = bool(kr_get("card", "ok"))
     await q.edit_message_text(
@@ -392,7 +364,6 @@ async def on_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cfg = {
         "rail": ud["rail"],
-        "rail_type": ud["rail_type"],
         "params": ud["params"],
         "indices": sorted(ud["sel"]),
         "passengers": ud["passengers"],
@@ -449,7 +420,6 @@ async def _run_session(application, cfg):
     def work():
         return run_reserve_loop(
             cfg["rail"],
-            rail_type=cfg["rail_type"],
             params=cfg["params"],
             indices=cfg["indices"],
             passengers=cfg["passengers"],
@@ -521,7 +491,6 @@ def run_bot(debug=False):
     conv = ConversationHandler(
         entry_points=[CommandHandler("book", cmd_book, filters=owner)],
         states={
-            RAIL: [CallbackQueryHandler(on_rail, pattern=r"^rail\|")],
             DEP: [CallbackQueryHandler(on_dep, pattern=r"^dep\|")],
             ARR: [CallbackQueryHandler(on_arr, pattern=r"^arr\|")],
             DATE: [

@@ -1,4 +1,4 @@
-"""choochoose CLI — interactive KTX/SRT reservation helper.
+"""choochoose CLI — interactive Korail (KTX / 구 SRT) reservation helper.
 
 Privacy notes:
   * Every secret (login id/password, card data, Telegram token/chat id, saved
@@ -7,12 +7,13 @@ Privacy notes:
     sensitive can be committed to git.
   * All keyring entries are namespaced under "choochoose:" so they never clash
     with other tools and are easy to find / wipe (see `choochoose --wipe`).
-  * The only network destinations are the official railway endpoints (in
-    srt.py / ktx.py) and — if you opt in — your own Telegram bot. There is no
-    telemetry, analytics, or any third-party call.
+  * The only network destinations are the official Korail endpoint (ktx.py)
+    and — if you opt in — your own Telegram bot. There is no telemetry,
+    analytics, or any third-party call.
 
-This project reuses the SRT client (MIT, ryanking13) and korail2 (BSD,
-carpedm20). Personal, non-commercial use only.
+SRT was merged into Korail, so there is exactly one backend: ktx.py. This
+project's structure derives from srtgo (MIT) and its Korail client from korail2
+(BSD, carpedm20). Personal, non-commercial use only.
 """
 
 try:
@@ -24,7 +25,7 @@ from datetime import datetime, timedelta
 from json.decoder import JSONDecodeError
 from random import gammavariate
 from termcolor import colored
-from typing import Awaitable, Callable, List, Optional, Tuple, Union
+from typing import Awaitable, Callable, List, Optional, Tuple
 
 import asyncio
 import click
@@ -37,6 +38,7 @@ import re
 from .ktx import (
     Korail,
     KorailError,
+    NoResultsError,
     ReserveOption,
     TrainType,
     AdultPassenger,
@@ -44,18 +46,6 @@ from .ktx import (
     SeniorPassenger,
     Disability1To3Passenger,
     Disability4To6Passenger,
-)
-
-from .srt import (
-    SRT,
-    SRTError,
-    SRTNetFunnelError,
-    SeatType,
-    Adult,
-    Child,
-    Senior,
-    Disability1To3,
-    Disability4To6,
 )
 
 # All keyring services are stored under this namespace so choochoose's secrets
@@ -85,47 +75,64 @@ def kr_del(service: str, key: str) -> None:
 # Every (service, key) pair choochoose may persist. Used by --wipe so a user
 # can remove every trace of their data from the OS keyring in one command.
 KEYRING_KEYS = {
-    "SRT": ["id", "pass", "ok", "station", "options",
-            "departure", "arrival", "date", "time",
-            "adult", "child", "senior", "disability1to3", "disability4to6"],
-    "KTX": ["id", "pass", "ok", "station",
+    "KTX": ["id", "pass", "ok", "station", "options",
             "departure", "arrival", "date", "time",
             "adult", "child", "senior", "disability1to3", "disability4to6"],
     "telegram": ["ok", "token", "chat_id"],
     "card": ["ok", "number", "password", "birthday", "expire"],
+    # 통합 전 SRT 경로가 남긴 항목들. --wipe가 옛 사용자의 잔여 데이터까지
+    # 지우도록 목록만 유지한다 (더 이상 쓰이지 않음).
+    "SRT": ["id", "pass", "ok", "station", "options",
+            "departure", "arrival", "date", "time",
+            "adult", "child", "senior", "disability1to3", "disability4to6"],
 }
 
 
-STATIONS = {
-    "SRT": [
-        "수서", "동탄", "평택지제", "경주", "곡성", "공주", "광주송정", "구례구",
-        "김천(구미)", "나주", "남원", "대전", "동대구", "마산", "목포", "밀양",
-        "부산", "서대구", "순천", "여수EXPO", "여천", "오송", "울산(통도사)",
-        "익산", "전주", "정읍", "진영", "진주", "창원", "창원중앙", "천안아산",
-        "포항",
-    ],
-    "KTX": [
-        "서울", "용산", "영등포", "광명", "수원", "천안아산", "오송", "대전",
-        "서대전", "김천구미", "동대구", "경주", "포항", "밀양", "구포", "부산",
-        "울산(통도사)", "마산", "창원중앙", "경산", "논산", "익산", "정읍",
-        "광주송정", "목포", "전주", "순천", "여수EXPO", "청량리", "강릉",
-        "행신", "정동진",
-    ],
-}
-DEFAULT_STATIONS = {
-    "SRT": ["수서", "대전", "동대구", "부산"],
-    "KTX": ["서울", "대전", "동대구", "부산"],
-}
+# 역 목록. Korail 조회 API는 역 코드가 아니라 역명 문자열을 그대로 받으므로
+# (ktx.py의 txtGoStart/txtGoEnd) 노선 단위로 넓게 둘 수 있다. 아래 64개는
+# 라이브 API로 전수 확인했다 (잘못된 역명은 WRG200004로 거부된다).
+# 여기 없는 역은 메뉴의 "역 직접 수정"으로 입력하면 된다.
+STATIONS = [
+    # 경부선 · 경부고속선
+    "서울", "용산", "영등포", "광명", "수원", "천안아산", "오송", "대전",
+    "김천구미", "동대구", "경산", "밀양", "구포", "부산", "경주",
+    "울산(통도사)", "행신",
+    # 수서평택고속선 (구 SRT 전용역 — 통합 후 Korail에서 KTX-산천으로 잡힌다)
+    "수서", "동탄", "평택지제", "서대구",
+    # 호남선 · 호남고속선
+    "서대전", "계룡", "논산", "공주", "익산", "정읍", "광주송정", "나주",
+    "목포",
+    # 전라선
+    "전주", "남원", "곡성", "구례구", "순천", "여천", "여수EXPO",
+    # 경전선
+    "진영", "창원", "창원중앙", "마산", "진주",
+    # 동해선
+    "포항", "태화강", "부전",
+    # 중앙선 (KTX-이음)
+    "청량리", "상봉", "양평", "서원주", "원주", "제천", "단양", "풍기",
+    "영주", "안동",
+    # 강릉선 · 동해북부
+    "만종", "횡성", "둔내", "평창", "진부(오대산)", "강릉", "정동진",
+    "묵호", "동해",
+]
+DEFAULT_STATIONS = ["서울", "용산", "광명", "천안아산", "대전", "동대구",
+                    "부산", "광주송정", "강릉"]
+
+# 키링 서비스명. 기존 사용자의 저장된 로그인/역/옵션이 그대로 살아 있도록
+# 통합 전과 같은 "KTX"를 계속 쓴다.
+RAIL = "KTX"
 
 # 예약 간격 (평균 간격 (초) = SHAPE * SCALE): gamma distribution (1.25 +/- 0.25 s)
 RESERVE_INTERVAL_SHAPE = 4
 RESERVE_INTERVAL_SCALE = 0.25
 RESERVE_INTERVAL_MIN = 0.25
 
-WAITING_BAR = ["|", "/", "-", "\\"]
+# 재로그인이 이만큼 연속으로 실패하면 루프를 접는다. 자격증명이 틀린 경우는
+# 기다린다고 낫지 않는데, 봇의 handle_error는 항상 True라 그대로 두면
+# 1.25초마다 코레일 로그인 엔드포인트를 영원히 두드린다.
+MAX_LOGIN_RETRIES = 3
 
-RailType = Union[str, None]
-ChoiceType = Union[int, None]
+WAITING_BAR = ["|", "/", "-", "\\"]
 
 
 @click.command()
@@ -155,23 +162,17 @@ def choochoose(debug=False, wipe=False, bot=False):
         ("나가기", -1),
     ]
 
-    RAIL_CHOICES = [
-        (colored("SRT", "red"), "SRT"),
-        (colored("KTX", "cyan"), "KTX"),
-        ("취소", -1),
-    ]
-
     ACTIONS = {
-        1: lambda rt: reserve(rt, debug),
-        2: lambda rt: check_reservation(rt, debug),
-        3: lambda rt: set_login(rt, debug),
-        4: lambda _: set_telegram(),
-        5: lambda _: set_card(),
-        6: lambda rt: set_station(rt),
-        7: lambda rt: edit_station(rt),
-        8: lambda _: set_options(),
-        9: lambda _: wipe_secrets(),
-        10: lambda _: start_bot(debug),
+        1: lambda: reserve(debug),
+        2: lambda: check_reservation(debug),
+        3: lambda: set_login(debug),
+        4: set_telegram,
+        5: set_card,
+        6: set_station,
+        7: edit_station,
+        8: set_options,
+        9: wipe_secrets,
+        10: lambda: start_bot(debug),
     }
 
     while True:
@@ -182,19 +183,14 @@ def choochoose(debug=False, wipe=False, bot=False):
         if choice == -1:
             break
 
-        if choice in {1, 2, 3, 6, 7}:
-            rail_type = inquirer.list_input(
-                message="열차 선택 (↕:이동, Enter: 선택, Ctrl-C: 취소)",
-                choices=RAIL_CHOICES,
-            )
-            if rail_type in {-1, None}:
-                continue
-        else:
-            rail_type = None
-
         action = ACTIONS.get(choice)
         if action:
-            action(rail_type)
+            try:
+                action()
+            except KorailError as err:
+                # 로그인 미설정이나 API 오류로 메뉴 동작 하나가 실패해도
+                # CLI 전체가 traceback으로 죽지 않고 메뉴로 돌아간다.
+                print(colored(err.msg, "green", "on_red") + "\n")
 
 
 def start_bot(debug=False) -> None:
@@ -223,8 +219,8 @@ def wipe_secrets() -> None:
     print("저장된 모든 개인정보를 keyring에서 삭제했습니다.")
 
 
-def set_station(rail_type: RailType) -> bool:
-    stations, default_station_key = get_station(rail_type)
+def set_station() -> bool:
+    stations, default_station_key = get_station()
 
     if not (
         station_info := inquirer.prompt(
@@ -244,19 +240,19 @@ def set_station(rail_type: RailType) -> bool:
         print("선택된 역이 없습니다.")
         return False
 
-    kr_set(rail_type, "station", (selected_stations := ",".join(selected)))
+    kr_set(RAIL, "station", (selected_stations := ",".join(selected)))
     print(f"선택된 역: {selected_stations}")
     return True
 
 
-def edit_station(rail_type: RailType) -> bool:
-    stations, default_station_key = get_station(rail_type)
+def edit_station() -> bool:
+    stations, default_station_key = get_station()
     station_info = inquirer.prompt(
         [
             inquirer.Text(
                 "stations",
                 message="역 수정 (예: 수서,대전,동대구)",
-                default=kr_get(rail_type, "station") or "",
+                default=kr_get(RAIL, "station") or "",
             )
         ]
     )
@@ -274,23 +270,22 @@ def edit_station(rail_type: RailType) -> bool:
     for station in selected:
         if not hangul.search(station):
             print(f"'{station}'는 잘못된 입력입니다. 기본 역으로 설정합니다.")
-            selected = DEFAULT_STATIONS[rail_type]
+            selected = DEFAULT_STATIONS
             break
 
-    kr_set(rail_type, "station", (selected_stations := ",".join(selected)))
+    kr_set(RAIL, "station", (selected_stations := ",".join(selected)))
     print(f"선택된 역: {selected_stations}")
     return True
 
 
-def get_station(rail_type: RailType) -> Tuple[List[str], List[str]]:
-    stations = STATIONS[rail_type]
-    station_key = kr_get(rail_type, "station")
+def get_station() -> Tuple[List[str], List[str]]:
+    station_key = kr_get(RAIL, "station")
 
     if not station_key:
-        return stations, DEFAULT_STATIONS[rail_type]
+        return STATIONS, DEFAULT_STATIONS
 
     valid_keys = [x for x in station_key.split(",")]
-    return stations, valid_keys
+    return STATIONS, valid_keys
 
 
 def set_options():
@@ -316,11 +311,17 @@ def set_options():
         return
 
     options = choices.get("options", [])
-    kr_set("SRT", "options", ",".join(options))
+    kr_set(RAIL, "options", ",".join(options))
 
 
 def get_options():
-    options = kr_get("SRT", "options") or ""
+    # 통합 전에는 옵션이 "SRT" 서비스에 저장됐다. 기존 사용자의 저장값을 잃지
+    # 않도록 한 번만 옮겨온다.
+    options = kr_get(RAIL, "options")
+    if options is None and (legacy := kr_get("SRT", "options")) is not None:
+        kr_set(RAIL, "options", legacy)
+        kr_del("SRT", "options")
+        options = legacy
     return options.split(",") if options else []
 
 
@@ -426,22 +427,22 @@ def pay_card(rail, reservation) -> bool:
     return False
 
 
-def set_login(rail_type="SRT", debug=False):
+def set_login(debug=False):
     credentials = {
-        "id": kr_get(rail_type, "id") or "",
-        "pass": kr_get(rail_type, "pass") or "",
+        "id": kr_get(RAIL, "id") or "",
+        "pass": kr_get(RAIL, "pass") or "",
     }
 
     login_info = inquirer.prompt(
         [
             inquirer.Text(
                 "id",
-                message=f"{rail_type} 계정 아이디 (멤버십 번호, 이메일, 전화번호)",
+                message="코레일 계정 아이디 (멤버십 번호, 이메일, 전화번호)",
                 default=credentials["id"],
             ),
             inquirer.Password(
                 "pass",
-                message=f"{rail_type} 계정 패스워드",
+                message="코레일 계정 패스워드",
                 default=credentials["pass"],
             ),
         ]
@@ -450,36 +451,38 @@ def set_login(rail_type="SRT", debug=False):
         return False
 
     try:
-        SRT(
-            login_info["id"], login_info["pass"], verbose=debug
-        ) if rail_type == "SRT" else Korail(
-            login_info["id"], login_info["pass"], verbose=debug
-        )
+        rail = Korail(login_info["id"], login_info["pass"], verbose=debug)
 
-        kr_set(rail_type, "id", login_info["id"])
-        kr_set(rail_type, "pass", login_info["pass"])
-        kr_set(rail_type, "ok", "1")
+        # Korail.login()은 자격증명이 틀려도 예외를 던지지 않고 False를
+        # 반환한다. .logined 를 확인하지 않으면 오타 난 비밀번호가 그대로
+        # "검증 완료(ok=1)"로 키링에 저장된다.
+        if not rail.logined:
+            print("로그인에 실패했습니다. 아이디/비밀번호를 확인하세요.")
+            kr_del(RAIL, "ok")
+            return False
+
+        kr_set(RAIL, "id", login_info["id"])
+        kr_set(RAIL, "pass", login_info["pass"])
+        kr_set(RAIL, "ok", "1")
         return True
-    except SRTError as err:
+    except KorailError as err:
         print(err)
-        kr_del(rail_type, "ok")
+        kr_del(RAIL, "ok")
         return False
 
 
-def login(rail_type="SRT", debug=False):
-    if kr_get(rail_type, "id") is None or kr_get(rail_type, "pass") is None:
-        set_login(rail_type)
+def login(debug=False):
+    if kr_get(RAIL, "id") is None or kr_get(RAIL, "pass") is None:
+        # 입력을 취소하거나 실패하면 자격증명이 없다. 그대로 진행하면
+        # Korail(None, None)이 되어 이메일 정규식에서 TypeError가 난다.
+        if not set_login(debug=debug):
+            raise KorailError("로그인 정보가 설정되지 않았습니다")
 
-    user_id = kr_get(rail_type, "id")
-    password = kr_get(rail_type, "pass")
-
-    rail = SRT if rail_type == "SRT" else Korail
-    return rail(user_id, password, verbose=debug)
+    return Korail(kr_get(RAIL, "id"), kr_get(RAIL, "pass"), verbose=debug)
 
 
-def reserve(rail_type="SRT", debug=False):
-    rail = login(rail_type, debug=debug)
-    is_srt = rail_type == "SRT"
+def reserve(debug=False):
+    rail = login(debug=debug)
 
     # Get date, time, stations, and passenger info
     now = datetime.now() + timedelta(minutes=10)
@@ -487,36 +490,29 @@ def reserve(rail_type="SRT", debug=False):
     this_time = now.strftime("%H%M%S")
 
     defaults = {
-        "departure": kr_get(rail_type, "departure") or ("수서" if is_srt else "서울"),
-        "arrival": kr_get(rail_type, "arrival") or "동대구",
-        "date": kr_get(rail_type, "date") or today,
-        "time": kr_get(rail_type, "time") or "120000",
-        "adult": int(kr_get(rail_type, "adult") or 1),
-        "child": int(kr_get(rail_type, "child") or 0),
-        "senior": int(kr_get(rail_type, "senior") or 0),
-        "disability1to3": int(kr_get(rail_type, "disability1to3") or 0),
-        "disability4to6": int(kr_get(rail_type, "disability4to6") or 0),
+        "departure": kr_get(RAIL, "departure") or "서울",
+        "arrival": kr_get(RAIL, "arrival") or "동대구",
+        "date": kr_get(RAIL, "date") or today,
+        "time": kr_get(RAIL, "time") or "120000",
+        "adult": int(kr_get(RAIL, "adult") or 1),
+        "child": int(kr_get(RAIL, "child") or 0),
+        "senior": int(kr_get(RAIL, "senior") or 0),
+        "disability1to3": int(kr_get(RAIL, "disability1to3") or 0),
+        "disability4to6": int(kr_get(RAIL, "disability4to6") or 0),
     }
 
     # Set default stations if departure equals arrival
     if defaults["departure"] == defaults["arrival"]:
-        defaults["arrival"] = (
-            "동대구" if defaults["departure"] in ("수서", "서울") else None
-        )
+        defaults["arrival"] = "동대구" if defaults["departure"] == "서울" else None
         defaults["departure"] = (
-            defaults["departure"]
-            if defaults["arrival"]
-            else ("수서" if is_srt else "서울")
+            defaults["departure"] if defaults["arrival"] else "서울"
         )
 
-    stations, station_key = get_station(rail_type)
+    stations, station_key = get_station()
     options = get_options()
 
-    # Calculate dynamic booking window (SRT: D-30, KTX: D-31; both open at 07:00)
-    if is_srt:
-        max_days = 30 if now.hour >= 7 else 29
-    else:
-        max_days = 31 if now.hour >= 7 else 30
+    # Calculate dynamic booking window (D-31, opens at 07:00)
+    max_days = 31 if now.hour >= 7 else 30
 
     # Generate date choices within the window
     date_choices = [
@@ -570,11 +566,11 @@ def reserve(rail_type="SRT", debug=False):
     }
 
     passenger_classes = {
-        "adult": Adult if is_srt else AdultPassenger,
-        "child": Child if is_srt else ChildPassenger,
-        "senior": Senior if is_srt else SeniorPassenger,
-        "disability1to3": Disability1To3 if is_srt else Disability1To3Passenger,
-        "disability4to6": Disability4To6 if is_srt else Disability4To6Passenger,
+        "adult": AdultPassenger,
+        "child": ChildPassenger,
+        "senior": SeniorPassenger,
+        "disability1to3": Disability1To3Passenger,
+        "disability4to6": Disability4To6Passenger,
     }
 
     PASSENGER_TYPE = {
@@ -610,7 +606,7 @@ def reserve(rail_type="SRT", debug=False):
 
     # Save preferences
     for key, value in info.items():
-        kr_set(rail_type, key, str(value))
+        kr_set(RAIL, key, str(value))
 
     # Adjust time if needed
     if info["date"] == today and int(info["time"]) < int(this_time):
@@ -646,17 +642,20 @@ def reserve(rail_type="SRT", debug=False):
         "date": info["date"],
         "time": info["time"],
         "passengers": [passenger_classes["adult"](total_count)],
-        **(
-            {"available_only": False}
-            if is_srt
-            else {
-                "include_no_seats": True,
-                **({"train_type": TrainType.KTX} if "ktx" in options else {}),
-            }
-        ),
+        "include_no_seats": True,
+        **({"train_type": TrainType.KTX} if "ktx" in options else {}),
     }
 
-    trains = rail.search_train(**params)
+    try:
+        trains = rail.search_train(**params)
+    except NoResultsError:
+        # 조회 결과 없음. 해당 구간에 직통 열차가 없거나(코레일 조회 API는
+        # 환승 경로를 돌려주지 않는다) 그 날짜·시간대에 운행이 없다.
+        print(
+            colored("조회된 열차가 없습니다", "green", "on_red")
+            + " — 직통 열차가 없는 구간이거나 해당 날짜·시간대에 운행이 없습니다.\n"
+        )
+        return
 
     def train_decorator(train):
         msg = train.__repr__()
@@ -665,10 +664,6 @@ def reserve(rail_type="SRT", debug=False):
             .replace("가능", colored("가능", "green"))
             .replace("신청하기", colored("가능", "green"))
         )
-
-    if not trains:
-        print(colored("예약 가능한 열차가 없습니다", "green", "on_red") + "\n")
-        return
 
     # Get train selection
     q_choice = [
@@ -688,16 +683,15 @@ def reserve(rail_type="SRT", debug=False):
     n_trains = len(choice["trains"])
 
     # Get seat type preference
-    seat_type = SeatType if is_srt else ReserveOption
     q_options = [
         inquirer.List(
             "type",
             message="선택 유형",
             choices=[
-                ("일반실 우선", seat_type.GENERAL_FIRST),
-                ("일반실만", seat_type.GENERAL_ONLY),
-                ("특실 우선", seat_type.SPECIAL_FIRST),
-                ("특실만", seat_type.SPECIAL_ONLY),
+                ("일반실 우선", ReserveOption.GENERAL_FIRST),
+                ("일반실만", ReserveOption.GENERAL_ONLY),
+                ("특실 우선", ReserveOption.SPECIAL_FIRST),
+                ("특실만", ReserveOption.SPECIAL_ONLY),
             ],
         ),
         inquirer.Confirm("pay", message="예매 시 카드 결제", default=False),
@@ -729,7 +723,6 @@ def reserve(rail_type="SRT", debug=False):
 
     run_reserve_loop(
         rail,
-        rail_type=rail_type,
         params=params,
         indices=choice["trains"],
         passengers=passengers,
@@ -745,7 +738,6 @@ def reserve(rail_type="SRT", debug=False):
 def run_reserve_loop(
     rail,
     *,
-    rail_type,
     params,
     indices,
     passengers,
@@ -774,10 +766,24 @@ def run_reserve_loop(
 
         notify(f"🎫 🎉 예매 성공!!! 🎉 🎫\n{msg}")
 
-        if pay and not reserve.is_waiting and pay_card(rail, reserve):
-            notify("💳 ✨ 결제 성공!!! ✨ 💳")
+        # 예매는 이 시점에 이미 끝났다. 결제 단계에서 난 예외를 밖으로
+        # 흘리면 재시도 루프가 같은 열차를 다시 예매하려 든다.
+        try:
+            if (
+                pay
+                and not getattr(reserve, "is_waiting", False)
+                and pay_card(rail, reserve)
+            ):
+                notify("💳 ✨ 결제 성공!!! ✨ 💳")
+        except Exception as ex:  # noqa: BLE001 — 예매는 지킨다
+            notify(
+                f"⚠️ 예매는 완료됐지만 결제에 실패했습니다: {getattr(ex, 'msg', ex)}\n"
+                "구입기한 내에 코레일 앱에서 직접 결제하세요."
+            )
 
     i_try = 0
+    relogin = False
+    login_fails = 0
     start_time = time.time()
     while True:
         if should_stop is not None and should_stop():
@@ -787,50 +793,47 @@ def run_reserve_loop(
             if on_tick is not None:
                 on_tick(i_try, time.time() - start_time)
 
+            # 재로그인은 except 블록이 아니라 여기서 한다. except 안에서
+            # login()을 부르면 재로그인이 던진 예외(예: ConnectionError)를
+            # 아무도 잡지 못해 루프가 통째로 죽는다.
+            if relogin:
+                try:
+                    rail = login(debug=debug)
+                except KorailError as ex:
+                    # 키링에 자격증명이 없다. 재시도해도 달라지지 않는다.
+                    handle_error(ex)
+                    return False
+                if not rail.logined:
+                    # 응답은 왔는데 로그인이 안 됐다 = 자격증명 문제.
+                    # 기다린다고 나아지지 않으므로 몇 번만 시도하고 접는다.
+                    login_fails += 1
+                    if login_fails >= MAX_LOGIN_RETRIES:
+                        handle_error(
+                            KorailError(
+                                "재로그인에 반복 실패했습니다. 로그인 정보를 확인하세요."
+                            )
+                        )
+                        return False
+                    _sleep()
+                    continue
+                login_fails = 0
+                relogin = False
+
             trains = rail.search_train(**params)
             for i in indices:
-                if _is_seat_available(trains[i], option, rail_type):
+                if _is_seat_available(trains[i], option):
                     _reserve(trains[i])
                     return True
-            _sleep()
-
-        except SRTError as ex:
-            msg = ex.msg
-            if "정상적인 경로로 접근 부탁드립니다" in msg or isinstance(
-                ex, SRTNetFunnelError
-            ):
-                if debug:
-                    print(
-                        f"\nException: {ex}\nType: {type(ex)}\nArgs: {ex.args}\nMessage: {msg}"
-                    )
-                rail.clear()
-            elif "로그인 후 사용하십시오" in msg:
-                if debug:
-                    print(
-                        f"\nException: {ex}\nType: {type(ex)}\nArgs: {ex.args}\nMessage: {msg}"
-                    )
-                rail = login(rail_type, debug=debug)
-                if not rail.is_login and not handle_error(ex):
-                    return False
-            elif not any(
-                err in msg
-                for err in (
-                    "잔여석없음",
-                    "사용자가 많아 접속이 원활하지 않습니다",
-                    "예약대기 접수가 마감되었습니다",
-                    "예약대기자한도수초과",
-                )
-            ):
-                if not handle_error(ex):
-                    return False
             _sleep()
 
         except KorailError as ex:
             msg = ex.msg
             if "Need to Login" in msg:
-                rail = login(rail_type, debug=debug)
-                if not rail.is_login and not handle_error(ex):
-                    return False
+                if debug:
+                    print(
+                        f"\nException: {ex}\nType: {type(ex)}\nArgs: {ex.args}\nMessage: {msg}"
+                    )
+                relogin = True
             elif not any(
                 err in msg
                 for err in ("Sold out", "잔여석없음", "예약대기자한도수초과")
@@ -844,20 +847,24 @@ def run_reserve_loop(
                 print(
                     f"\nException: {ex}\nType: {type(ex)}\nArgs: {ex.args}\nMessage: {ex.msg}"
                 )
+            relogin = True
             _sleep()
-            rail = login(rail_type, debug=debug)
 
         except ConnectionError as ex:
+            # 네트워크 단절은 일시적이다. 로그인 실패 카운터는 올리지 않고
+            # 계속 재시도한다.
             if not handle_error(ex, "연결이 끊겼습니다"):
                 return False
-            rail = login(rail_type, debug=debug)
+            relogin = True
+            _sleep()
 
         except Exception as ex:
             if debug:
                 print("\nUndefined exception")
             if not handle_error(ex):
                 return False
-            rail = login(rail_type, debug=debug)
+            relogin = True
+            _sleep()
 
 
 def _sleep():
@@ -878,33 +885,22 @@ def _handle_error(ex, msg=None):
     return inquirer.confirm(message="계속할까요", default=True)
 
 
-def _is_seat_available(train, seat_type, rail_type):
-    if rail_type == "SRT":
-        if not train.seat_available():
-            return train.reserve_standby_available()
-        if seat_type in [SeatType.GENERAL_FIRST, SeatType.SPECIAL_FIRST]:
-            return train.seat_available()
-        if seat_type == SeatType.GENERAL_ONLY:
-            return train.general_seat_available()
-        return train.special_seat_available()
-    else:
-        if not train.has_seat():
-            return train.has_waiting_list()
-        if seat_type in [ReserveOption.GENERAL_FIRST, ReserveOption.SPECIAL_FIRST]:
-            return train.has_seat()
-        if seat_type == ReserveOption.GENERAL_ONLY:
-            return train.has_general_seat()
-        return train.has_special_seat()
+def _is_seat_available(train, seat_type):
+    if not train.has_seat():
+        return train.has_waiting_list()
+    if seat_type in [ReserveOption.GENERAL_FIRST, ReserveOption.SPECIAL_FIRST]:
+        return train.has_seat()
+    if seat_type == ReserveOption.GENERAL_ONLY:
+        return train.has_general_seat()
+    return train.has_special_seat()
 
 
-def check_reservation(rail_type="SRT", debug=False):
-    rail = login(rail_type, debug=debug)
+def check_reservation(debug=False):
+    rail = login(debug=debug)
 
     while True:
-        reservations = (
-            rail.get_reservations() if rail_type == "SRT" else rail.reservations()
-        )
-        tickets = [] if rail_type == "SRT" else rail.tickets()
+        reservations = rail.reservations()
+        tickets = rail.tickets()
 
         all_reservations = []
         for t in tickets:
@@ -938,8 +934,6 @@ def check_reservation(rail_type="SRT", debug=False):
                 out.append("[ 예매 내역 ]")
                 for reservation in all_reservations:
                     out.append(f"🚅{reservation}")
-                    if rail_type == "SRT":
-                        out.extend(map(str, reservation.tickets))
 
             if out:
                 tgprintf = get_telegram()

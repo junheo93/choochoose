@@ -1,4 +1,4 @@
-"""choochoose — a privacy-respecting KTX/SRT reservation helper.
+"""choochoose — a privacy-respecting Korail (KTX) reservation helper.
 
 choo-choo, meet *choose your train*.
 """
